@@ -2,7 +2,7 @@
 extern crate rocket;
 
 use crate::map::JobMap;
-use crate::models::{Job, JobIdentifier, JobQueueError, JobRequest, JobStatus};
+use crate::models::{Job, JobIdentifier, JobQueueError, JobRequest, JobStatus, JobType};
 use crate::queue::JobQueue;
 use rocket::http::hyper::StatusCode;
 use rocket::http::{ContentType, Status};
@@ -21,7 +21,8 @@ mod queue;
 fn enqueue(
     job: Json<JobRequest>,
     state: &State<JobMap>,
-    queue: &State<JobQueue>,
+    low_queue: &State<JobQueue>,
+    high_queue: &State<JobQueue>,
 ) -> Result<Accepted<Json<JobIdentifier>>, JobQueueError> {
     let job_id = Uuid::new_v4().to_string();
 
@@ -29,23 +30,41 @@ fn enqueue(
         id: job_id.clone(),
         job_type: job.job_type.clone(),
         job_status: JobStatus::Queued,
+        job_implementer: None,
     };
 
     state.insert(&job_id, job_data)?;
 
     // TODO Should I make the queue bounded to protect against OOM panic?
-    match queue.enqueue(job_id) {
-        Ok(id) => {
-            println!("Successfully enqueued the message"); //TODO: use log package with levels {DEBUG, INFO, ERROR}
-            Ok(Accepted(Some(Json(JobIdentifier { id }))))
+    match job.job_type {
+        JobType::TimeCritical => {
+            match high_queue.enqueue(job_id) {
+                Ok(id) => {
+                    println!("Successfully enqueued the message with high priority"); //TODO: use log package with levels {DEBUG, INFO, ERROR}
+                    Ok(Accepted(Some(Json(JobIdentifier { id }))))
+                }
+                Err(_) => Err(JobQueueError::InternalError),
+            }
         }
-        Err(_) => Err(JobQueueError::InternalError),
+        JobType::NotTimeCritical => match low_queue.enqueue(job_id) {
+            Ok(id) => {
+                println!("Successfully enqueued the message with low priority");
+                Ok(Accepted(Some(Json(JobIdentifier { id }))))
+            }
+            Err(_) => Err(JobQueueError::InternalError),
+        },
     }
 }
 
 #[get("/dequeue", format = "application/json")]
-fn dequeue(state: &State<JobMap>, queue: &State<JobQueue>) -> Result<Json<Job>, JobQueueError> {
-    match queue.dequeue()? {
+fn dequeue(
+    state: &State<JobMap>,
+    high_queue: &State<JobQueue>,
+    low_queue: &State<JobQueue>,
+) -> Result<Json<Job>, JobQueueError> {
+    let queue_consumer = "123";
+
+    match high_queue.dequeue()? {
         Some(id) => {
             //ASSUMPTION: The Job should be marked IN_PROGRESS as it is dequeued
             let current = state.get(&id)?;
@@ -53,18 +72,46 @@ fn dequeue(state: &State<JobMap>, queue: &State<JobQueue>) -> Result<Json<Job>, 
                 id: current.id.clone(),
                 job_type: current.job_type.clone(),
                 job_status: JobStatus::InProgress,
+                job_implementer: Some(queue_consumer.to_string()),
             };
             state.insert(&current.id, new.clone())?;
             Ok(Json(new))
         }
         //ASSUMPTION: If there is nothing to dequeue, return Not Found
-        None => Err(JobQueueError::NotFound),
+        None => {
+            match low_queue.dequeue()? {
+                Some(id) => {
+                    //ASSUMPTION: The Job should be marked IN_PROGRESS as it is dequeued
+                    let current = state.get(&id)?;
+                    let new = Job {
+                        id: current.id.clone(),
+                        job_type: current.job_type.clone(),
+                        job_status: JobStatus::InProgress,
+                        job_implementer: Some(queue_consumer.to_string()),
+                    };
+                    state.insert(&current.id, new.clone())?;
+                    Ok(Json(new))
+                }
+                //ASSUMPTION: If there is nothing to dequeue, return Not Found
+                None => Err(JobQueueError::NotFound),
+            }
+        }
     }
 }
 
 #[post("/<job_id>/conclude", format = "application/json")]
 fn conclude(job_id: String, state: &State<JobMap>) -> Result<(), JobQueueError> {
     let job = state.get(&job_id)?;
+    let queue_consumer = "123";
+
+    match job.job_implementer.clone() {
+        None => return Err(JobQueueError::Unauthorized),
+        Some(implementer) => {
+            if implementer != queue_consumer {
+                return Err(JobQueueError::Unauthorized);
+            }
+        }
+    };
 
     state.insert(
         &job_id,
@@ -72,6 +119,7 @@ fn conclude(job_id: String, state: &State<JobMap>) -> Result<(), JobQueueError> 
             id: job.id,
             job_type: job.job_type,
             job_status: JobStatus::Concluded,
+            job_implementer: job.job_implementer,
         },
     )?;
     Ok(())
@@ -88,12 +136,14 @@ fn get_job(job_id: String, state: &State<JobMap>) -> Result<Json<Job>, JobQueueE
 #[launch]
 fn rocket() -> Rocket<Build> {
     let state = JobMap::new();
-    let deque = JobQueue::new();
+    let low = JobQueue::new();
+    let high = JobQueue::new();
 
     //ASSUMPTION: When deployed to production, a load balancer is serving HTTPS and terminating SSL
     rocket::build()
         .mount("/jobs", routes![enqueue, dequeue, conclude, get_job])
-        .manage(deque)
+        .manage(low)
+        .manage(high)
         .manage(state)
 }
 
@@ -128,7 +178,17 @@ impl<'r, 'o: 'r> Responder<'r, 'o> for JobQueueError {
             .status(Status::NotFound)
             .header(ContentType::JSON)
             .ok(),
-
+            JobQueueError::Unauthorized => Response::build_from(
+                Json(Error {
+                    code: StatusCode::UNAUTHORIZED.to_string(),
+                    message: "You are not authorized to do this operation".to_string(),
+                })
+                .respond_to(req)
+                .unwrap(),
+            )
+            .status(Status::Unauthorized)
+            .header(ContentType::JSON)
+            .ok(),
             _ => Response::build_from(
                 Json(Error {
                     code: StatusCode::INTERNAL_SERVER_ERROR.to_string(),
@@ -146,11 +206,18 @@ impl<'r, 'o: 'r> Responder<'r, 'o> for JobQueueError {
 
 #[cfg(test)]
 mod tests {
+    use crate::enqueue;
+    use crate::models::Job;
+    use rocket::State;
+    use std::collections::HashMap;
+    use std::convert::TryFrom;
     use std::error::Error;
 
     #[test]
     pub fn test_enqueue_returns_successfully() -> Result<(), Box<dyn Error>> {
-        //TODO fill in implementation
+        let result = State::try_from(HashMap::new())?;
+
+        // enqueue(job_request, map, queue);
         Ok(())
     }
 

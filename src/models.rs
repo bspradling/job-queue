@@ -10,6 +10,8 @@ pub enum JobQueueError {
     NotImplemented,
     #[error("Not Found")]
     NotFound,
+    #[error("Unauthorized")]
+    Unauthorized,
 }
 
 #[derive(Serialize)]
@@ -30,6 +32,7 @@ pub struct Job {
     pub job_type: JobType,
     #[serde(rename = "status")]
     pub job_status: JobStatus,
+    pub job_implementer: Option<String>,
 }
 
 #[derive(Clone, Eq, PartialEq, Deserialize, Debug, Serialize)]

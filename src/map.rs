@@ -46,6 +46,7 @@ mod tests {
             id: "123".to_string(),
             job_type: JobType::TimeCritical,
             job_status: JobStatus::Queued,
+            job_implementer: None,
         });
 
         let job = expected.clone().unwrap();
@@ -53,7 +54,7 @@ mod tests {
 
         let actual = map.get(&job.id)?;
 
-        assert_eq!(actual, expected);
+        assert_eq!(Some(actual), expected);
         Ok(())
     }
 }
